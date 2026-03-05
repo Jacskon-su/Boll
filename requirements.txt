@@ -6,4 +6,3 @@ twstock
 plotly
 gspread
 google-auth
-concurrent-futures
