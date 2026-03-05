@@ -1,0 +1,9 @@
+streamlit
+yfinance
+pandas
+numpy
+twstock
+plotly
+gspread
+google-auth
+concurrent-futures
