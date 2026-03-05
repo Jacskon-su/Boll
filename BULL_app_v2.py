@@ -33,11 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-try:
-    import twstock
-except ImportError:
-    st.error("❌ 缺少 `twstock` 套件，請執行 `pip install twstock`")
-    st.stop()
+import requests
 
 st.markdown("""
 <style>
@@ -162,15 +158,43 @@ init_state()
 # ==========================================
 # 股票清單
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_map():
+    """從證交所和櫃買中心 API 取得全台股清單（不依賴 twstock）"""
     stock_map = {}
-    for code, info in twstock.twse.items():
-        if len(code) == 4 and code.isdigit():
-            stock_map[f"{code}.TW"] = {"code": code, "name": info.name}
-    for code, info in twstock.tpex.items():
-        if len(code) == 4 and code.isdigit():
-            stock_map[f"{code}.TWO"] = {"code": code, "name": info.name}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 上市（TWSE）
+    try:
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            for item in r.json():
+                code = str(item.get("Code", "")).strip()
+                name = str(item.get("Name", "")).strip()
+                if len(code) == 4 and code.isdigit() and name:
+                    stock_map[f"{code}.TW"] = {"code": code, "name": name}
+    except Exception:
+        pass
+
+    # 上櫃（TPEx）
+    try:
+        url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            for item in r.json():
+                code = str(item.get("SecuritiesCompanyCode", "")).strip()
+                name = str(item.get("CompanyName", "")).strip()
+                if len(code) == 4 and code.isdigit() and name:
+                    stock_map[f"{code}.TWO"] = {"code": code, "name": name}
+    except Exception:
+        pass
+
+    # 備援：若 API 失敗回傳空，改用 yfinance 硬清單
+    if not stock_map:
+        for code in [str(i) for i in range(1101, 9999)]:
+            stock_map[f"{code}.TW"] = {"code": code, "name": code}
+
     return stock_map
 
 # ==========================================
