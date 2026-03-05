@@ -6,3 +6,4 @@ twstock
 plotly
 gspread
 google-auth
+twstock
