@@ -33,7 +33,12 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+import concurrent.futures
 import requests
+try:
+    import twstock
+except ImportError:
+    twstock = None
 
 st.markdown("""
 <style>
@@ -160,42 +165,51 @@ init_state()
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_map():
-    """從證交所和櫃買中心 API 取得全台股清單（不依賴 twstock）"""
+    """取得全台股清單，與狙擊手策略相同方式"""
     stock_map = {}
+
+    # 主要：twstock（最完整，約 1800+ 支）
+    if twstock is not None:
+        try:
+            for code, info in twstock.twse.items():
+                if len(code) == 4 and code.isdigit():
+                    stock_map[f"{code}.TW"] = {"code": code, "name": info.name}
+            for code, info in twstock.tpex.items():
+                if len(code) == 4 and code.isdigit():
+                    stock_map[f"{code}.TWO"] = {"code": code, "name": info.name}
+            return stock_map
+        except Exception:
+            pass
+
+    # 備援：證交所 API（當日有成交，約 800~900 支）
     headers = {"User-Agent": "Mozilla/5.0"}
-
-    # 上市（TWSE）
     try:
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            headers=headers, timeout=15)
         if r.status_code == 200:
             for item in r.json():
-                code = str(item.get("Code", "")).strip()
-                name = str(item.get("Name", "")).strip()
-                if len(code) == 4 and code.isdigit() and name:
-                    stock_map[f"{code}.TW"] = {"code": code, "name": name}
+                c = str(item.get("Code", "")).strip()
+                n = str(item.get("Name", "")).strip()
+                if len(c) == 4 and c.isdigit() and n:
+                    stock_map[f"{c}.TW"] = {"code": c, "name": n}
     except Exception:
         pass
-
-    # 上櫃（TPEx）
     try:
-        url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+            headers=headers, timeout=15)
         if r.status_code == 200:
             for item in r.json():
-                code = str(item.get("SecuritiesCompanyCode", "")).strip()
-                name = str(item.get("CompanyName", "")).strip()
-                if len(code) == 4 and code.isdigit() and name:
-                    stock_map[f"{code}.TWO"] = {"code": code, "name": name}
+                c = str(item.get("SecuritiesCompanyCode", "")).strip()
+                n = str(item.get("CompanyName", "")).strip()
+                if len(c) == 4 and c.isdigit() and n:
+                    stock_map[f"{c}.TWO"] = {"code": c, "name": n}
     except Exception:
         pass
-
-    # 備援：若 API 失敗回傳空，改用 yfinance 硬清單
-    if not stock_map:
-        for code in [str(i) for i in range(1101, 9999)]:
-            stock_map[f"{code}.TW"] = {"code": code, "name": code}
 
     return stock_map
+
 
 # ==========================================
 # 指標計算
@@ -264,15 +278,37 @@ def check_exit(df):
     return (c < sma) and (vol >= vma5), c, sma, vol / vma5 if vma5 > 0 else 0
 
 # ==========================================
-# 批量下載
+# 資料下載（逐支快取 + 批量備援）
 # ==========================================
-def fetch_all(symbols, period="6mo", pb=None):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_one(symbol: str, period: str = "6mo"):
+    """單支股票下載，有快取（盤後1小時）"""
+    try:
+        df = yf.Ticker(symbol).history(period=period, auto_adjust=True)
+        if df.empty:
+            return None
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df.columns = [c.capitalize() for c in df.columns]
+        return df
+    except Exception:
+        return None
+
+def fetch_all_cached(symbols, period="6mo", pb=None):
+    """
+    批量下載：先用 yf.download 批量抓（快），
+    失敗的單支再用 fetch_one 補（有快取）
+    """
     all_data   = {}
-    chunk_size = 100
+    chunk_size = 150
     chunks     = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
+
+    # 第一步：批量下載
     for idx, batch in enumerate(chunks, 1):
         if pb:
-            pb.progress(idx / len(chunks), text=f"下載中 {idx}/{len(chunks)} 批...")
+            pb.progress(idx / len(chunks) * 0.8,
+                        text=f"批量下載 {idx}/{len(chunks)} 批...")
         try:
             raw = yf.download(batch, period=period, progress=False,
                               group_by="ticker", threads=True, auto_adjust=True)
@@ -300,7 +336,97 @@ def fetch_all(symbols, period="6mo", pb=None):
                         continue
         except Exception:
             continue
+
+    # 第二步：批量失敗的補用 fetch_one（有快取）
+    missing = [s for s in symbols if s not in all_data]
+    if missing and pb:
+        pb.progress(0.85, text=f"補下載 {len(missing)} 支...")
+    for sym in missing:
+        df = fetch_one(sym, period)
+        if df is not None:
+            all_data[sym] = df
+
     return all_data
+
+# ==========================================
+# 單支股票策略運算（供 ThreadPool 使用）
+# ==========================================
+def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
+    """單支股票的指標計算與訊號判斷，回傳結果 dict"""
+    result = {"entry": None, "addon_b": None, "addon_a": None, "exit": None,
+              "sym": sym, "high_update": None}
+    try:
+        if len(df) < 40:
+            return result
+        df   = calc_indicators(df.copy())
+        info = stock_map.get(sym, {"code": sym.replace(".TW","").replace(".TWO",""), "name": ""})
+        c    = float(df["Close"].iloc[-1])
+
+        # 更新最高價
+        if sym in pos_symbols:
+            result["high_update"] = (sym, round(c, 2))
+
+        # 進場
+        if sym not in pos_symbols and check_entry(df):
+            result["entry"] = {
+                "代號"   : info["code"], "名稱": info["name"],
+                "收盤價" : round(c, 2),
+                "上軌"   : round(float(df["Upper"].iloc[-1]), 2),
+                "下軌"   : round(float(df["Lower"].iloc[-1]), 2),
+                "15MA"   : round(float(df["SMA"].iloc[-1]), 2),
+                "成交量" : int(df["Volume"].iloc[-1]),
+                "5MA量"  : int(df["Vol_MA5"].iloc[-1]),
+                "15MA量" : int(df["Vol_MA15"].iloc[-1]),
+                "symbol" : sym, "_df": df,
+            }
+
+        if sym in pos_symbols and len(pos_df) > 0:
+            mask = pos_df["symbol"] == sym
+            if not mask.any():
+                return result
+            pos_row = pos_df[mask].iloc[-1]
+
+            # 出場優先
+            ex, c_ex, sma_ex, vr = check_exit(df)
+            if ex:
+                result["exit"] = {
+                    "代號"     : info["code"], "名稱": info["name"],
+                    "收盤價"   : round(c_ex, 2), "15MA": round(sma_ex, 2),
+                    "量/5MA量" : f"{vr:.1f}x",
+                    "進場價"   : float(pos_row["進場價"]),
+                    "損益%"    : round((c_ex - float(pos_row["進場價"])) / float(pos_row["進場價"]) * 100, 2),
+                    "加碼次數" : int(pos_row["加碼次數"]),
+                    "symbol"   : sym, "_df": df,
+                }
+                return result
+
+            # 加碼B
+            tb, c_b, last_p, profit = check_addon_b(df, pos_row)
+            if tb:
+                result["addon_b"] = {
+                    "代號"       : info["code"], "名稱": info["name"],
+                    "收盤價"     : round(c_b, 2),
+                    "持倉最高價" : round(float(pos_row["持倉最高價"]), 2),
+                    "上次加碼價" : round(last_p, 2),
+                    "距上次加碼" : f"+{profit*100:.1f}%",
+                    "加碼次數"   : int(pos_row["加碼次數"]),
+                    "symbol"     : sym, "_df": df,
+                }
+
+            # 加碼A
+            ta, c_a, sma_a, vma15_a = check_addon_a(df)
+            if ta:
+                result["addon_a"] = {
+                    "代號"    : info["code"], "名稱": info["name"],
+                    "收盤價"  : round(c_a, 2), "15MA": round(sma_a, 2),
+                    "成交量"  : int(df["Volume"].iloc[-1]),
+                    "15MA量"  : int(vma15_a) if vma15_a else 0,
+                    "加碼次數": int(pos_row["加碼次數"]),
+                    "symbol"  : sym, "_df": df,
+                }
+    except Exception:
+        pass
+    return result
 
 # ==========================================
 # 主掃描
@@ -310,93 +436,43 @@ def run_scan(stock_map, positions):
     pos_symbols = positions["symbol"].tolist() if len(positions) > 0 else []
     dl_symbols  = list(set(all_symbols + pos_symbols))
 
-    pb       = st.progress(0, text="準備下載...")
-    all_data = fetch_all(dl_symbols, period="6mo", pb=pb)
-    pb.progress(1.0, text=f"✅ 下載完成 {len(all_data)} 支")
+    pb = st.progress(0, text="準備下載...")
 
-    entry_signals  = []
+    # 批量下載（有快取補援）
+    all_data = fetch_all_cached(dl_symbols, period="6mo", pb=pb)
+    pb.progress(0.9, text=f"✅ 下載完成 {len(all_data)} 支，分析中...")
+
+    entry_signals   = []
     addon_b_signals = []
     addon_a_signals = []
-    exit_signals   = []
-    pos_df         = positions.copy()
+    exit_signals    = []
+    pos_df          = positions.copy()
 
-    for sym, df in all_data.items():
-        if len(df) < 40:
-            continue
-        try:
-            df   = calc_indicators(df.copy())
-            info = stock_map.get(sym, {"code": sym.replace(".TW","").replace(".TWO",""), "name": ""})
-            c    = float(df["Close"].iloc[-1])
-
-            # 更新持倉最高價
-            if sym in pos_symbols and len(pos_df) > 0:
-                mask = pos_df["symbol"] == sym
+    # ThreadPool 並行策略運算
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        futures = {
+            executor.submit(analyze_one, sym, df, stock_map, pos_symbols, pos_df): sym
+            for sym, df in all_data.items()
+        }
+        done  = 0
+        total = len(futures)
+        for future in concurrent.futures.as_completed(futures):
+            done += 1
+            if done % 100 == 0 or done == total:
+                pb.progress(0.9 + 0.1 * done / total,
+                            text=f"策略運算 {done}/{total}...")
+            res = future.result()
+            if res["high_update"]:
+                sym_, price_ = res["high_update"]
+                mask = pos_df["symbol"] == sym_
                 if mask.any():
                     idx_ = pos_df[mask].index[-1]
-                    if c > float(pos_df.loc[idx_, "持倉最高價"]):
-                        pos_df.loc[idx_, "持倉最高價"] = round(c, 2)
-
-            # 進場
-            if sym not in pos_symbols and check_entry(df):
-                entry_signals.append({
-                    "代號"   : info["code"], "名稱": info["name"],
-                    "收盤價" : round(c, 2),
-                    "上軌"   : round(float(df["Upper"].iloc[-1]), 2),
-                    "下軌"   : round(float(df["Lower"].iloc[-1]), 2),
-                    "15MA"   : round(float(df["SMA"].iloc[-1]), 2),
-                    "成交量" : int(df["Volume"].iloc[-1]),
-                    "5MA量"  : int(df["Vol_MA5"].iloc[-1]),
-                    "15MA量" : int(df["Vol_MA15"].iloc[-1]),
-                    "symbol" : sym, "_df": df,
-                })
-
-            if sym in pos_symbols and len(pos_df) > 0:
-                mask    = pos_df["symbol"] == sym
-                if not mask.any():
-                    continue
-                pos_row = pos_df[mask].iloc[-1]
-
-                # 出場優先
-                ex, c_ex, sma_ex, vr = check_exit(df)
-                if ex:
-                    exit_signals.append({
-                        "代號"     : info["code"], "名稱": info["name"],
-                        "收盤價"   : round(c_ex, 2), "15MA": round(sma_ex, 2),
-                        "量/5MA量" : f"{vr:.1f}x",
-                        "進場價"   : float(pos_row["進場價"]),
-                        "損益%"    : round((c_ex - float(pos_row["進場價"])) / float(pos_row["進場價"]) * 100, 2),
-                        "加碼次數" : int(pos_row["加碼次數"]),
-                        "symbol"   : sym, "_df": df,
-                    })
-                    continue
-
-                # 加碼B
-                tb, c_b, last_p, profit = check_addon_b(df, pos_row)
-                if tb:
-                    addon_b_signals.append({
-                        "代號"       : info["code"], "名稱": info["name"],
-                        "收盤價"     : round(c_b, 2),
-                        "持倉最高價" : round(float(pos_row["持倉最高價"]), 2),
-                        "上次加碼價" : round(last_p, 2),
-                        "距上次加碼" : f"+{profit*100:.1f}%",
-                        "加碼次數"   : int(pos_row["加碼次數"]),
-                        "symbol"     : sym, "_df": df,
-                    })
-
-                # 加碼A
-                ta, c_a, sma_a, vma15_a = check_addon_a(df)
-                if ta:
-                    addon_a_signals.append({
-                        "代號"    : info["code"], "名稱": info["name"],
-                        "收盤價"  : round(c_a, 2), "15MA": round(sma_a, 2),
-                        "成交量"  : int(df["Volume"].iloc[-1]),
-                        "15MA量"  : int(vma15_a) if vma15_a else 0,
-                        "加碼次數": int(pos_row["加碼次數"]),
-                        "symbol"  : sym, "_df": df,
-                    })
-
-        except Exception:
-            continue
+                    if price_ > float(pos_df.loc[idx_, "持倉最高價"]):
+                        pos_df.loc[idx_, "持倉最高價"] = price_
+            if res["entry"]  : entry_signals.append(res["entry"])
+            if res["addon_b"]: addon_b_signals.append(res["addon_b"])
+            if res["addon_a"]: addon_a_signals.append(res["addon_a"])
+            if res["exit"]   : exit_signals.append(res["exit"])
 
     st.session_state["positions"] = pos_df
     pb.empty()

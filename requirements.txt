@@ -6,3 +6,4 @@ plotly
 gspread
 google-auth
 requests
+twstock
