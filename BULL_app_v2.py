@@ -36,8 +36,9 @@ import concurrent.futures
 import requests
 try:
     import twstock
-except ImportError:
-    st.error("❌ 缺少 `twstock` 套件，請執行 `pip install twstock`")
+    _ = twstock.twse  # 確認資料庫有載入
+except Exception as _twstock_err:
+    st.error(f"❌ twstock 載入失敗：{_twstock_err}\n\n請確認 requirements.txt 包含 twstock")
     st.stop()
 
 st.markdown("""
