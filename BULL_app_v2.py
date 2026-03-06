@@ -37,7 +37,8 @@ import requests
 try:
     import twstock
 except ImportError:
-    twstock = None
+    st.error("❌ 缺少 `twstock` 套件，請執行 `pip install twstock`")
+    st.stop()
 
 st.markdown("""
 <style>
@@ -163,168 +164,164 @@ init_state()
 # ==========================================
 # 股票清單
 # ==========================================
-def is_trading_hours():
-    now = datetime.datetime.now()
-    if now.weekday() >= 5:
-        return False
-    open_  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
-    close_ = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    return open_ <= now <= close_
+# ==========================================
+# 股票清單 & 資料下載（原封不動來自 ALL_v12）
+# ==========================================
 
-def get_stock_map():
-    """完全照狙擊手寫法取得股票清單"""
+def is_trading_hours():
+    """判斷目前是否在台股交易時段 (09:00~13:30)"""
+    now = datetime.datetime.now()
+    if now.weekday() >= 5:  # 週六日
+        return False
+    market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    market_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+def get_cache_ttl():
+    return 300 if is_trading_hours() else 3600
+
+@st.cache_data(ttl=3600)
+def get_stock_info_map():
     try:
         stock_map = {}
         for code, info in twstock.twse.items():
             if len(code) == 4:
-                stock_map[f"{code}.TW"] = {"code": code, "name": info.name}
+                stock_map[code] = {
+                    'name': f"{code} {info.name}",
+                    'symbol': f"{code}.TW",
+                    'short_name': info.name,
+                    'group': getattr(info, 'group', '其他')
+                }
         for code, info in twstock.tpex.items():
             if len(code) == 4:
-                stock_map[f"{code}.TWO"] = {"code": code, "name": info.name}
+                stock_map[code] = {
+                    'name': f"{code} {info.name}",
+                    'symbol': f"{code}.TWO",
+                    'short_name': info.name,
+                    'group': getattr(info, 'group', '其他')
+                }
         return stock_map
     except Exception as e:
+        logger.error(f"get_stock_info_map 錯誤: {e}")
         return {}
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_history_data(symbol, period="6mo"):
-    """照狙擊手寫法，逐支下載，有快取"""
+@st.cache_data(ttl=get_cache_ttl(), show_spinner=False)
+def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
     try:
-        df = yf.Ticker(symbol).history(period=period)
+        ticker = yf.Ticker(symbol)
+        if start_date and end_date:
+            df = ticker.history(start=start_date, end=end_date)
+        else:
+            df = ticker.history(period=period)
         if df.empty:
             return None
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         return df
-    except Exception:
+    except Exception as e:
+        logger.warning(f"fetch_history_data 錯誤 [{symbol}]: {e}")
         return None
 
+def get_stock_data_with_realtime(code, symbol, analysis_date_str):
+    df = fetch_history_data(symbol)
+    if df is None or df.empty:
+        return None
 
-# ==========================================
-# 指標計算
-# ==========================================
-def calc_indicators(df):
-    close  = df["Close"]
-    volume = df["Volume"]
-    bp     = PARAMS["boll_period"]
-    df["SMA"]       = close.rolling(bp).mean()
-    df["Std"]       = close.rolling(bp).std()
-    df["Upper"]     = df["SMA"] + df["Std"] * PARAMS["boll_std"]
-    df["Lower"]     = df["SMA"] - df["Std"] * PARAMS["boll_std"]
-    df["Bandwidth"] = df["Upper"] - df["Lower"]
-    df["Vol_MA5"]   = volume.rolling(PARAMS["vol_ma_days"]).mean()
-    df["Vol_MA15"]  = volume.rolling(PARAMS["vol_shrink_days"]).mean()
-    df["Vol_MA20"]  = volume.rolling(PARAMS["vol_ma20_days"]).mean()
-    sq_n = PARAMS["squeeze_n"]
-    df["BW_Min"]         = df["Bandwidth"].rolling(sq_n).min()
-    df["Is_Squeeze"]     = df["Bandwidth"] == df["BW_Min"]
-    lb = PARAMS["squeeze_lookback"]
-    df["Squeeze_Recent"] = df["Is_Squeeze"].shift(1).rolling(lb).max() == 1
-    df["SMA_Up"]         = df["SMA"] > df["SMA"].shift(PARAMS["sma_trend_days"])
+    last_dt = df.index[-1].strftime('%Y-%m-%d')
+    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    if analysis_date_str == today_str and last_dt != today_str:
+        try:
+            realtime = twstock.realtime.get(code)
+            if realtime['success'] and realtime['realtime']['latest_trade_price'] != '-':
+                rt = realtime['realtime']
+                new_row = pd.Series({
+                    'Open': float(rt['open']), 'High': float(rt['high']),
+                    'Low': float(rt['low']), 'Close': float(rt['latest_trade_price']),
+                    'Volume': float(rt['accumulate_trade_volume']) * 1000
+                }, name=pd.Timestamp(today_str))
+                df = pd.concat([df, new_row.to_frame().T])
+        except Exception as e:
+            logger.warning(f"get_stock_data_with_realtime 即時資料錯誤 [{code}]: {e}")
     return df
 
-# ==========================================
-# 訊號判斷
-# ==========================================
-def check_entry(df):
-    if len(df) < PARAMS["boll_period"] + PARAMS["squeeze_n"]:
-        return False
-    row = df.iloc[-1]
-    return (
-        bool(row["Squeeze_Recent"]) and
-        float(row["Close"]) > float(row["Upper"]) and
-        float(row["Volume"]) > float(row["Vol_MA5"]) * PARAMS["vol_ratio"] and
-        bool(row["SMA_Up"]) and
-        float(row["Vol_MA20"]) > PARAMS["min_vol_shares"]
-    )
+def fetch_data_batch(stock_map, period="300d", chunk_size=150):
+    all_symbols = [info['symbol'] for info in stock_map.values()]
+    data_store = {}
+    symbol_to_code = {v['symbol']: k for k, v in stock_map.items()}
 
-def check_addon_b(df, pos_row):
-    c            = float(df["Close"].iloc[-1])
-    pos_high     = float(pos_row["持倉最高價"])
-    last_p       = float(pos_row["上次加碼價"])
-    profit       = (c - last_p) / last_p
-    return (c > pos_high) and (profit >= PARAMS["addon_b_profit"]), c, last_p, profit
+    total_chunks = (len(all_symbols) // chunk_size) + 1
+    progress_text = st.empty()
+    bar = st.progress(0)
 
-def check_addon_a(df):
-    if len(df) < 3:
-        return False, None, None, None
-    c_today    = float(df["Close"].iloc[-1])
-    c_yest     = float(df["Close"].iloc[-2])
-    sma_today  = float(df["SMA"].iloc[-1])
-    sma_yest   = float(df["SMA"].iloc[-2])
-    vol_yest   = float(df["Volume"].iloc[-2])
-    vma15_yest = float(df["Vol_MA15"].iloc[-2])
-    triggered  = (c_yest < sma_yest) and (vol_yest < vma15_yest) and (c_today >= sma_today)
-    return triggered, c_today, sma_today, float(df["Vol_MA15"].iloc[-1])
-
-def check_exit(df):
-    if len(df) < 2:
-        return False, None, None, None
-    c    = float(df["Close"].iloc[-1])
-    sma  = float(df["SMA"].iloc[-1])
-    vol  = float(df["Volume"].iloc[-1])
-    vma5 = float(df["Vol_MA5"].iloc[-1])
-    return (c < sma) and (vol >= vma5), c, sma, vol / vma5 if vma5 > 0 else 0
-
-# ==========================================
-# 資料下載（逐支快取 + 批量備援）
-# ==========================================
-# 批量下載（照狙擊手：yf.download批量 + fetch_history_data逐支補）
-# ==========================================
-def fetch_all_cached(symbols, period="6mo", pb=None, scan_date=""):
-    all_data   = {}
-    chunk_size = 150
-    chunks     = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
-
-    # 第一步：yf.download 批量下載（快）
-    for idx, batch in enumerate(chunks, 1):
-        if pb:
-            pb.progress(idx / len(chunks) * 0.8,
-                        text=f"批量下載 {idx}/{len(chunks)} 批...")
-        try:
-            raw = yf.download(batch, period=period, progress=False,
-                              group_by="ticker", threads=True, auto_adjust=True)
-            if len(batch) == 1:
-                sym = batch[0]
-                if not raw.empty:
-                    df = raw.copy()
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df = df.droplevel(1, axis=1)
-                    df.index = pd.to_datetime(df.index)
-                    if df.index.tz is not None:
-                        df.index = df.index.tz_localize(None)
-                    all_data[sym] = df
-            else:
-                for sym in batch:
-                    try:
-                        df = raw[sym].dropna(how="all")
-                        if df.empty:
-                            continue
-                        df.index = pd.to_datetime(df.index)
-                        if df.index.tz is not None:
-                            df.index = df.index.tz_localize(None)
-                        all_data[sym] = df
-                    except Exception:
-                        continue
-        except Exception:
+    for i in range(0, len(all_symbols), chunk_size):
+        chunk = all_symbols[i:i + chunk_size]
+        if not chunk:
             continue
 
-    # 第二步：失敗的用 fetch_history_data 逐支補（照狙擊手，有快取）
-    missing = [s for s in symbols if s not in all_data]
-    if missing and pb:
-        pb.progress(0.85, text=f"補下載 {len(missing)} 支...")
-    for sym in missing:
-        df = fetch_history_data(sym, period)
-        if df is not None:
-            all_data[sym] = df
+        chunk_idx = (i // chunk_size) + 1
+        progress_text.text(f"📥 正在批量下載歷史資料... (批次 {chunk_idx}/{total_chunks})")
+        bar.progress(chunk_idx / total_chunks)
 
-    # 第三步：依 scan_date 截斷
-    if scan_date:
-        cutoff  = pd.Timestamp(scan_date)
-        trimmed = {s: d[d.index <= cutoff] for s, d in all_data.items()
-                   if len(d[d.index <= cutoff]) >= 40}
-        all_data = trimmed
+        try:
+            tickers_str = " ".join(chunk)
+            batch_df = yf.download(tickers_str, period=period, group_by='ticker', threads=True, auto_adjust=True, progress=False)
 
-    return all_data
+            if not batch_df.empty:
+                if isinstance(batch_df.columns, pd.MultiIndex):
+                    for symbol in chunk:
+                        try:
+                            if symbol in batch_df:
+                                stock_df = batch_df[symbol].dropna()
+                                if not stock_df.empty:
+                                    if stock_df.index.tz is not None:
+                                        stock_df.index = stock_df.index.tz_localize(None)
+                                    code = symbol_to_code.get(symbol)
+                                    if code:
+                                        data_store[code] = stock_df
+                        except Exception as e:
+                            logger.warning(f"批次解析錯誤 [{symbol}]: {e}")
+                else:
+                    symbol = chunk[0]
+                    stock_df = batch_df.dropna()
+                    if not stock_df.empty:
+                        if stock_df.index.tz is not None:
+                            stock_df.index = stock_df.index.tz_localize(None)
+                        code = symbol_to_code.get(symbol)
+                        if code:
+                            data_store[code] = stock_df
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"批次下載錯誤 (batch {chunk_idx}): {e}")
+            st.toast(f"批次下載錯誤: {e}")
+            continue
+
+    progress_text.empty()
+    bar.empty()
+    return data_store
+
+def fetch_realtime_batch(codes_list, chunk_size=50):
+    realtime_data = {}
+    progress_text = st.empty()
+
+    for i in range(0, len(codes_list), chunk_size):
+        chunk = codes_list[i:i + chunk_size]
+        progress_text.text(f"⚡ 正在批量更新即時盤... ({i}/{len(codes_list)})")
+        try:
+            stocks = twstock.realtime.get(chunk)
+            if stocks:
+                if 'success' in stocks:
+                    if stocks['success']:
+                        realtime_data[stocks['info']['code']] = stocks['realtime']
+                else:
+                    for code, data in stocks.items():
+                        if data['success']:
+                            realtime_data[code] = data['realtime']
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"fetch_realtime_batch 錯誤 (offset {i}): {e}")
+    progress_text.empty()
+    return realtime_data
 
 
 # ==========================================
@@ -407,16 +404,33 @@ def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
 # 主掃描
 # ==========================================
 def run_scan(stock_map, positions):
-    all_symbols = list(stock_map.keys())
+    """
+    stock_map 格式（來自 get_stock_info_map）：
+      {"2330": {"symbol": "2330.TW", "name": "...", "short_name": "...", "group": "..."}}
+    fetch_data_batch 回傳：
+      {"2330": df, ...}  ← key 是 code
+    """
     pos_symbols = positions["symbol"].tolist() if len(positions) > 0 else []
-    dl_symbols  = list(set(all_symbols + pos_symbols))
+    # 把持倉的 symbol 轉成 code 加入掃描
+    pos_codes = [s.replace(".TW","").replace(".TWO","") for s in pos_symbols]
+    # 確保持倉股也在 stock_map 裡
+    for sym in pos_symbols:
+        c = sym.replace(".TW","").replace(".TWO","")
+        if c not in stock_map:
+            stock_map[c] = {"symbol": sym, "name": c, "short_name": c, "group": "其他"}
 
-    pb = st.progress(0, text="準備下載...")
-
-    # 批量下載（有快取補援，依掃描日期截斷）
     scan_date_str = st.session_state.get("scan_date_str", "")
-    all_data = fetch_all_cached(dl_symbols, period="6mo", pb=pb, scan_date=scan_date_str)
-    pb.progress(0.9, text=f"✅ 下載完成 {len(all_data)} 支，分析中...")
+
+    # 用 v12 原版 fetch_data_batch 下載（300d 足夠算指標）
+    all_data = fetch_data_batch(stock_map, period="300d")
+
+    # 依掃描日期截斷
+    if scan_date_str:
+        cutoff   = pd.Timestamp(scan_date_str)
+        all_data = {c: df[df.index <= cutoff] for c, df in all_data.items()
+                    if len(df[df.index <= cutoff]) >= 40}
+
+    pb = st.progress(0, text=f"✅ 下載完成 {len(all_data)} 支，策略運算中...")
 
     entry_signals   = []
     addon_b_signals = []
@@ -424,19 +438,22 @@ def run_scan(stock_map, positions):
     exit_signals    = []
     pos_df          = positions.copy()
 
-    # ThreadPool 並行策略運算
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         futures = {
-            executor.submit(analyze_one, sym, df, stock_map, pos_symbols, pos_df): sym
-            for sym, df in all_data.items()
+            executor.submit(analyze_one,
+                            stock_map[c]["symbol"],   # sym = "2330.TW"
+                            df,
+                            stock_map,
+                            pos_symbols,
+                            pos_df): c
+            for c, df in all_data.items() if c in stock_map
         }
         done  = 0
         total = len(futures)
         for future in concurrent.futures.as_completed(futures):
             done += 1
             if done % 100 == 0 or done == total:
-                pb.progress(0.9 + 0.1 * done / total,
-                            text=f"策略運算 {done}/{total}...")
+                pb.progress(done / total, text=f"策略運算 {done}/{total}...")
             res = future.result()
             if res["high_update"]:
                 sym_, price_ = res["high_update"]
