@@ -294,46 +294,37 @@ def calc_indicators(df):
     needed = [c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
     df = df[needed].copy()
     p  = PARAMS
-    df["SMA"]      = df["Close"].rolling(p["boll_period"]).mean()
-    df["STD"]      = df["Close"].rolling(p["boll_period"]).std()
-    df["Upper"]    = df["SMA"] + p["boll_std"] * df["STD"]
-    df["Lower"]    = df["SMA"] - p["boll_std"] * df["STD"]
-    df["BW"]       = df["Upper"] - df["Lower"]
-    df["BW_min"]   = df["BW"].rolling(p["squeeze_n"]).min()   # 過去N天最窄帶寬
-    df["Vol_MA5"]  = df["Volume"].rolling(p["vol_ma_days"]).mean()
-    df["Vol_MA15"] = df["Volume"].rolling(p["vol_shrink_days"]).mean()
-    df["Vol_MA20"] = df["Volume"].rolling(p["vol_ma20_days"]).mean()
-    df["SMA_trend"]= df["SMA"]   # 中軌趨勢用
+    df["SMA"]        = df["Close"].rolling(p["boll_period"]).mean()
+    df["STD"]        = df["Close"].rolling(p["boll_period"]).std()
+    df["Upper"]      = df["SMA"] + p["boll_std"] * df["STD"]
+    df["Lower"]      = df["SMA"] - p["boll_std"] * df["STD"]
+    df["BW"]         = df["Upper"] - df["Lower"]
+    df["BW_min"]     = df["BW"].rolling(p["squeeze_n"]).min()
+    # 原版壓縮：某天是15天最窄，且過去5天內曾出現
+    df["Is_Squeeze"]      = df["BW"] == df["BW_min"]
+    df["Squeeze_Recently"]= df["Is_Squeeze"].shift(1).rolling(window=p["squeeze_lookback"]).max() == 1
+    # 中軌趨勢：今天SMA > 3天前SMA（原版邏輯）
+    df["SMA_Trend_Up"]    = df["SMA"] > df["SMA"].shift(p["sma_trend_days"])
+    df["Vol_MA5"]         = df["Volume"].rolling(p["vol_ma_days"]).mean()
+    df["Vol_MA15"]        = df["Volume"].rolling(p["vol_shrink_days"]).mean()
     return df
 
 def check_entry(df):
     """
-    進場條件（對應 BULL_v7 回測版）：
-    1. 布林壓縮：今日帶寬 == 過去N天最窄（BW <= BW_min）
-    2. 中軌向上：連續 sma_trend_days 天上升
+    進場條件（對應原版 BULL.py 回測）：
+    1. 近期壓縮：過去 squeeze_lookback 天內曾出現帶寬最窄
+    2. 中軌向上：今天 SMA > sma_trend_days 天前 SMA
     3. 收盤突破上軌
     4. 爆量：Volume >= Vol_MA5 * vol_ratio 且 >= min_vol_shares
     """
-    p  = PARAMS
-    n  = p["sma_trend_days"]      # 預設 3
-    if len(df) < n + 1:
+    if len(df) < 2:
         return False
-
-    r  = df.iloc[-1]
-    # 1. 壓縮：今日帶寬是過去 squeeze_n 天最小值
-    squeeze = float(r["BW"]) <= float(r["BW_min"])
-
-    # 2. 中軌向上連續 n 天
-    smas = [df["SMA"].iloc[-(i+1)] for i in range(n)]
-    sma_up = all(smas[i] > smas[i+1] for i in range(len(smas)-1))
-
-    # 3. 突破上軌
+    r = df.iloc[-1]
+    squeeze  = bool(r["Squeeze_Recently"])
+    sma_up   = bool(r["SMA_Trend_Up"])
     breakout = float(r["Close"]) > float(r["Upper"])
-
-    # 4. 爆量
-    vol_ok = (float(r["Volume"]) >= float(r["Vol_MA5"]) * p["vol_ratio"]
-              and float(r["Volume"]) >= p["min_vol_shares"])
-
+    # 回測版只有 Volume > Vol_MA5 * 1.5，沒有 min_vol_shares 限制
+    vol_ok   = float(r["Volume"]) > float(r["Vol_MA5"]) * PARAMS["vol_ratio"]
     return squeeze and sma_up and breakout and vol_ok
 
 def check_addon_b(df, pos_row):
@@ -363,20 +354,18 @@ def check_addon_a(df):
     return triggered, c, sma, float(r["Vol_MA15"]) if r["Vol_MA15"] > 0 else None
 
 def check_exit(df):
-    """出場：出量跌破15MA 或 跌破下軌"""
+    """出場：當日最低價碰到或跌破下軌（對應回測版 sell_condition = Low <= Lower）"""
     if len(df) < 2:
         return False, None, None, None
-    r    = df.iloc[-1]
-    c    = float(r["Close"])
-    sma  = float(r["SMA"])
-    vma5 = float(r["Vol_MA5"])
-    vol  = float(r["Volume"])
-    # 出量跌破15MA
-    exit1 = (c < sma) and (vol >= vma5 * PARAMS["vol_ratio"])
-    # 跌破下軌
-    exit2 = c < float(r["Lower"])
-    triggered = exit1 or exit2
-    vr = vol / vma5 if vma5 > 0 else 0
+    r         = df.iloc[-1]
+    low       = float(r["Low"])
+    lower     = float(r["Lower"])
+    c         = float(r["Close"])
+    sma       = float(r["SMA"])
+    vma5      = float(r["Vol_MA5"])
+    vol       = float(r["Volume"])
+    triggered = low <= lower
+    vr        = vol / vma5 if vma5 > 0 else 0
     return triggered, c, sma, vr
 
 # ==========================================
@@ -544,13 +533,16 @@ def run_scan(stock_map, positions):
             r = df2.iloc[-1]
             samples.append({
                 "code": c,
-                "Close": round(float(r["Close"]),2),
-                "Upper": round(float(r["Upper"]),2),
-                "BW":    round(float(r["BW"]),4),
-                "BW_min":round(float(r["BW_min"]),4),
-                "squeeze": bool(r["BW"] <= r["BW_min"]),
-                "Vol":   int(r["Volume"]),
-                "Vol_MA5": int(r["Vol_MA5"]) if not pd.isna(r["Vol_MA5"]) else 0,
+                "Close":    round(float(r["Close"]),2),
+                "Upper":    round(float(r["Upper"]),2),
+                "BW":       round(float(r["BW"]),4),
+                "BW_min":   round(float(r["BW_min"]),4),
+                "Squeeze_Recently": bool(r["Squeeze_Recently"]),
+                "SMA_Trend_Up":     bool(r["SMA_Trend_Up"]),
+                "breakout": float(r["Close"]) > float(r["Upper"]),
+                "Vol":      int(r["Volume"]),
+                "Vol_MA5":  int(r["Vol_MA5"]) if not pd.isna(r["Vol_MA5"]) else 0,
+                "vol_ok":   float(r["Volume"]) >= float(r["Vol_MA5"]) * PARAMS["vol_ratio"],
             })
         except Exception as e:
             samples.append({"code": c, "error": str(e)})
