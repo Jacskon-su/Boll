@@ -527,6 +527,36 @@ def run_scan(stock_map, positions):
 
     st.session_state["positions"] = pos_df
     pb.empty()
+
+    # ── Debug 統計（確認各條件觸發數）──
+    debug_info = st.session_state.get("debug_info", {})
+    debug_info["total_scanned"] = total
+    debug_info["entry_count"]   = len(entry_signals)
+    debug_info["addon_b_count"] = len(addon_b_signals)
+    debug_info["addon_a_count"] = len(addon_a_signals)
+    debug_info["exit_count"]    = len(exit_signals)
+
+    # 抽樣檢查前3支的指標
+    samples = []
+    for c, df in list(all_data.items())[:3]:
+        try:
+            df2 = calc_indicators(df.copy())
+            r = df2.iloc[-1]
+            samples.append({
+                "code": c,
+                "Close": round(float(r["Close"]),2),
+                "Upper": round(float(r["Upper"]),2),
+                "BW":    round(float(r["BW"]),4),
+                "BW_min":round(float(r["BW_min"]),4),
+                "squeeze": bool(r["BW"] <= r["BW_min"]),
+                "Vol":   int(r["Volume"]),
+                "Vol_MA5": int(r["Vol_MA5"]) if not pd.isna(r["Vol_MA5"]) else 0,
+            })
+        except Exception as e:
+            samples.append({"code": c, "error": str(e)})
+    debug_info["samples"] = samples
+    st.session_state["debug_info"] = debug_info
+
     return {"entry": entry_signals, "addon_b": addon_b_signals,
             "addon_a": addon_a_signals, "exit": exit_signals}
 
@@ -646,6 +676,16 @@ st.markdown("---")
 if not result:
     st.info("👈 點擊左側「開始掃描」執行掃描")
     st.stop()
+
+# Debug 資訊
+debug = st.session_state.get("debug_info", {})
+if debug:
+    with st.expander("🔍 Debug 掃描資訊", expanded=True):
+        st.write(f"掃描支數: {debug.get('total_scanned',0)}")
+        st.write(f"進場訊號: {debug.get('entry_count',0)} | 加碼B: {debug.get('addon_b_count',0)} | 加碼A: {debug.get('addon_a_count',0)} | 出場: {debug.get('exit_count',0)}")
+        st.write("**前3支股票指標抽樣：**")
+        for s in debug.get("samples", []):
+            st.write(s)
 
 entry_n  = len(result["entry"])
 addon_b_n= len(result["addon_b"])
