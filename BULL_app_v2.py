@@ -561,7 +561,7 @@ with st.sidebar:
 # 主內容
 # ==========================================
 today_str = st.session_state.get("scan_date_str", datetime.date.today().strftime("%Y-%m-%d"))
-stock_map = get_stock_map()
+stock_map = get_stock_info_map()
 positions = st.session_state["positions"]
 
 if st.session_state["need_scan"]:
