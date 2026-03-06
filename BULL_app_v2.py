@@ -10,7 +10,6 @@ import warnings
 import datetime
 import logging
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # Google Sheets（可選，未設定時自動降級為 session_state）
 try:
@@ -146,6 +145,7 @@ def init_state():
         "scan_result"   : None,
         "last_scan_time": None,
         "gs_loaded"     : False,
+        "need_scan"     : False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -281,8 +281,8 @@ def check_exit(df):
 # 資料下載（逐支快取 + 批量備援）
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_one(symbol: str, period: str = "6mo"):
-    """單支股票下載，有快取（盤後1小時）"""
+def fetch_one(symbol: str, period: str = "6mo", scan_date: str = ""):
+    """單支股票下載，scan_date 當快取 key 確保不同日期不混用"""
     try:
         df = yf.Ticker(symbol).history(period=period, auto_adjust=True)
         if df.empty:
@@ -295,10 +295,11 @@ def fetch_one(symbol: str, period: str = "6mo"):
     except Exception:
         return None
 
-def fetch_all_cached(symbols, period="6mo", pb=None):
+def fetch_all_cached(symbols, period="6mo", pb=None, scan_date=""):
     """
     批量下載：先用 yf.download 批量抓（快），
     失敗的單支再用 fetch_one 補（有快取）
+    scan_date：截斷資料到此日期（含），確保回測不同日期正確
     """
     all_data   = {}
     chunk_size = 150
@@ -342,9 +343,19 @@ def fetch_all_cached(symbols, period="6mo", pb=None):
     if missing and pb:
         pb.progress(0.85, text=f"補下載 {len(missing)} 支...")
     for sym in missing:
-        df = fetch_one(sym, period)
+        df = fetch_one(sym, period, scan_date)
         if df is not None:
             all_data[sym] = df
+
+    # 第三步：根據 scan_date 截斷（選過去某天掃描用）
+    if scan_date:
+        cutoff = pd.Timestamp(scan_date)
+        trimmed = {}
+        for sym, df in all_data.items():
+            df_cut = df[df.index <= cutoff]
+            if len(df_cut) >= 40:
+                trimmed[sym] = df_cut
+        all_data = trimmed
 
     return all_data
 
@@ -377,8 +388,7 @@ def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
                 "成交量" : int(df["Volume"].iloc[-1]),
                 "5MA量"  : int(df["Vol_MA5"].iloc[-1]),
                 "15MA量" : int(df["Vol_MA15"].iloc[-1]),
-                "symbol" : sym, "_df": df,
-            }
+                "symbol" : sym,             }
 
         if sym in pos_symbols and len(pos_df) > 0:
             mask = pos_df["symbol"] == sym
@@ -396,8 +406,7 @@ def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
                     "進場價"   : float(pos_row["進場價"]),
                     "損益%"    : round((c_ex - float(pos_row["進場價"])) / float(pos_row["進場價"]) * 100, 2),
                     "加碼次數" : int(pos_row["加碼次數"]),
-                    "symbol"   : sym, "_df": df,
-                }
+                    "symbol"   : sym,                 }
                 return result
 
             # 加碼B
@@ -410,8 +419,7 @@ def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
                     "上次加碼價" : round(last_p, 2),
                     "距上次加碼" : f"+{profit*100:.1f}%",
                     "加碼次數"   : int(pos_row["加碼次數"]),
-                    "symbol"     : sym, "_df": df,
-                }
+                    "symbol"     : sym,                 }
 
             # 加碼A
             ta, c_a, sma_a, vma15_a = check_addon_a(df)
@@ -422,8 +430,7 @@ def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
                     "成交量"  : int(df["Volume"].iloc[-1]),
                     "15MA量"  : int(vma15_a) if vma15_a else 0,
                     "加碼次數": int(pos_row["加碼次數"]),
-                    "symbol"  : sym, "_df": df,
-                }
+                    "symbol"  : sym,                 }
     except Exception:
         pass
     return result
@@ -438,8 +445,9 @@ def run_scan(stock_map, positions):
 
     pb = st.progress(0, text="準備下載...")
 
-    # 批量下載（有快取補援）
-    all_data = fetch_all_cached(dl_symbols, period="6mo", pb=pb)
+    # 批量下載（有快取補援，依掃描日期截斷）
+    scan_date_str = st.session_state.get("scan_date_str", "")
+    all_data = fetch_all_cached(dl_symbols, period="6mo", pb=pb, scan_date=scan_date_str)
     pb.progress(0.9, text=f"✅ 下載完成 {len(all_data)} 支，分析中...")
 
     entry_signals   = []
@@ -479,46 +487,7 @@ def run_scan(stock_map, positions):
     return {"entry": entry_signals, "addon_b": addon_b_signals,
             "addon_a": addon_a_signals, "exit": exit_signals}
 
-# ==========================================
-# K線圖
-# ==========================================
-def plot_kline(df, sym, title=""):
-    df  = df.tail(60).copy()
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        row_heights=[0.7, 0.3], vertical_spacing=0.03)
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"],
-        increasing_line_color="red", decreasing_line_color="green", name="K線"
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Upper"],
-        line=dict(color="rgba(100,180,255,0.6)", width=1), name="上軌"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["SMA"],
-        line=dict(color="rgba(255,200,0,0.9)", width=1.5), name="15MA"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Lower"],
-        line=dict(color="rgba(100,180,255,0.6)", width=1),
-        fill="tonexty", fillcolor="rgba(100,180,255,0.05)", name="下軌"), row=1, col=1)
-    colors = ["red" if float(df["Close"].iloc[i]) >= float(df["Open"].iloc[i]) else "green"
-              for i in range(len(df))]
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"],
-        marker_color=colors, name="成交量", opacity=0.7), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Vol_MA5"],
-        line=dict(color="yellow", width=1), name="5MA量"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Vol_MA15"],
-        line=dict(color="cyan", width=1), name="15MA量"), row=2, col=1)
-    fig.update_layout(
-        title=dict(text=title, font=dict(size=14, color="white")),
-        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        font=dict(color="white"), xaxis_rangeslider_visible=False,
-        height=420, margin=dict(l=10, r=10, t=36, b=10),
-        legend=dict(orientation="h", y=1.02, font=dict(size=10)),
-    )
-    fig.update_xaxes(gridcolor="#2a2a2a")
-    fig.update_yaxes(gridcolor="#2a2a2a")
-    return fig
 
-# ==========================================
-# Google Sheets 連線
 # ==========================================
 # 持倉操作
 # ==========================================
@@ -568,9 +537,11 @@ with st.sidebar:
     # 掃描日期
     scan_date = st.date_input("📅 掃描日期", value=datetime.date.today())
     scan_date_str = scan_date.strftime("%Y-%m-%d")
+    st.session_state["scan_date_str"] = scan_date_str
 
     # 開始掃描按鈕
-    scan_btn = st.button("🔍 開始掃描", use_container_width=True, type="primary")
+    if st.button("🔍 開始掃描", use_container_width=True, type="primary"):
+        st.session_state["need_scan"] = True
     if st.session_state["last_scan_time"]:
         st.caption(f"上次掃描：{st.session_state['last_scan_time']}")
 
@@ -603,11 +574,12 @@ with st.sidebar:
 # ==========================================
 # 主內容
 # ==========================================
-today_str = scan_date_str if "scan_date_str" in dir() else datetime.date.today().strftime("%Y-%m-%d")
+today_str = st.session_state.get("scan_date_str", datetime.date.today().strftime("%Y-%m-%d"))
 stock_map = get_stock_map()
 positions = st.session_state["positions"]
 
-if scan_btn:
+if st.session_state["need_scan"]:
+    st.session_state["need_scan"] = False
     result = run_scan(stock_map, st.session_state["positions"])
     st.session_state["scan_result"]    = result
     st.session_state["last_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -616,7 +588,7 @@ if scan_btn:
 result = st.session_state["scan_result"]
 
 # 頂部標題 + 指標卡
-st.markdown(f"## 🐂 BULL 布林滾雪球掃描器　<span style='font-size:1rem;color:#888;'>{today_str}</span>",
+st.markdown(f"## 🐂 BULL 布林滾雪球　<span style='font-size:1rem;color:#888;'>{today_str}</span>",
             unsafe_allow_html=True)
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -638,6 +610,9 @@ addon_a_n= len(result["addon_a"])
 exit_n   = len(result["exit"])
 pos_n    = len(st.session_state["positions"])
 
+# ==========================================
+# Tabs
+# ==========================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     f"🟢 今日進場 ({entry_n})",
     f"🔵 創新高加碼 ({addon_b_n})",
@@ -674,11 +649,7 @@ with tab1:
                 st.markdown(f"**{r['代號']} {r['名稱']}**　收盤 `{r['收盤價']}`　上軌 `{r['上軌']}`　下軌 `{r['下軌']}`")
             with cc:
                 st.caption(f"量/5MA = {r['成交量']/r['5MA量']:.1f}x")
-        st.markdown("---")
-        for r in result["entry"]:
-            with st.expander(f"📈 {r['代號']} {r['名稱']} K線"):
-                st.plotly_chart(plot_kline(r["_df"], r["symbol"], f"{r['代號']} {r['名稱']}"),
-                                use_container_width=True)
+
 
 # ---------- Tab2 加碼B ----------
 with tab2:
@@ -703,11 +674,7 @@ with tab2:
                             f"上次加碼 `{r['上次加碼價']}`　"
                             f"<span style='color:#00aaff;font-weight:bold;font-size:1.1rem;'>{r['距上次加碼']}</span>",
                             unsafe_allow_html=True)
-        st.markdown("---")
-        for r in result["addon_b"]:
-            with st.expander(f"📈 {r['代號']} {r['名稱']} K線"):
-                st.plotly_chart(plot_kline(r["_df"], r["symbol"], f"{r['代號']} {r['名稱']}"),
-                                use_container_width=True)
+
 
 # ---------- Tab3 加碼A ----------
 with tab3:
@@ -734,11 +701,7 @@ with tab3:
                 ratio = r["成交量"] / r["15MA量"] if r["15MA量"] > 0 else 0
                 st.markdown(f"**{r['代號']} {r['名稱']}**　"
                             f"收盤 `{r['收盤價']}`　15MA `{r['15MA']}`　量/15MA量 = `{ratio:.2f}x`")
-        st.markdown("---")
-        for r in result["addon_a"]:
-            with st.expander(f"📈 {r['代號']} {r['名稱']} K線"):
-                st.plotly_chart(plot_kline(r["_df"], r["symbol"], f"{r['代號']} {r['名稱']}"),
-                                use_container_width=True)
+
 
 # ---------- Tab4 出場 ----------
 with tab4:
@@ -768,11 +731,7 @@ with tab4:
                     remove_position(r["symbol"])
                     st.success(f"✅ {r['代號']} 已移除持倉")
                     st.rerun()
-        st.markdown("---")
-        for r in result["exit"]:
-            with st.expander(f"📈 {r['代號']} {r['名稱']} K線"):
-                st.plotly_chart(plot_kline(r["_df"], r["symbol"], f"{r['代號']} {r['名稱']}"),
-                                use_container_width=True)
+
 
 # ---------- Tab5 持倉管理 ----------
 with tab5:
