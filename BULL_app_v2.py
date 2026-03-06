@@ -9,6 +9,7 @@ import numpy as np
 import warnings
 import datetime
 import logging
+logger = logging.getLogger(__name__)
 import plotly.graph_objects as go
 
 # Google Sheets（可選，未設定時自動降級為 session_state）
