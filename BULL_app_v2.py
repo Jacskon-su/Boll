@@ -165,40 +165,34 @@ init_state()
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_map():
-    """取得全台股清單，與狙擊手策略相同方式"""
+    """
+    取得全台股完整清單
+    來源1：證交所上市公司基本資料（全部掛牌，非當日成交）
+    來源2：櫃買中心上櫃公司基本資料（全部掛牌）
+    共約 1700~1900 支，每日快取一次
+    """
     stock_map = {}
-
-    # 主要：twstock（最完整，約 1800+ 支）
-    if twstock is not None:
-        try:
-            for code, info in twstock.twse.items():
-                if len(code) == 4 and code.isdigit():
-                    stock_map[f"{code}.TW"] = {"code": code, "name": info.name}
-            for code, info in twstock.tpex.items():
-                if len(code) == 4 and code.isdigit():
-                    stock_map[f"{code}.TWO"] = {"code": code, "name": info.name}
-            return stock_map
-        except Exception:
-            pass
-
-    # 備援：證交所 API（當日有成交，約 800~900 支）
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 上市（TWSE）— 全部掛牌公司，非當日成交
     try:
         r = requests.get(
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-            headers=headers, timeout=15)
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+            headers=headers, timeout=20)
         if r.status_code == 200:
             for item in r.json():
-                c = str(item.get("Code", "")).strip()
-                n = str(item.get("Name", "")).strip()
+                c = str(item.get("公司代號", "")).strip()
+                n = str(item.get("公司簡稱", "")).strip()
                 if len(c) == 4 and c.isdigit() and n:
                     stock_map[f"{c}.TW"] = {"code": c, "name": n}
     except Exception:
         pass
+
+    # 上櫃（TPEx）— 全部掛牌公司
     try:
         r = requests.get(
-            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
-            headers=headers, timeout=15)
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+            headers=headers, timeout=20)
         if r.status_code == 200:
             for item in r.json():
                 c = str(item.get("SecuritiesCompanyCode", "")).strip()
@@ -207,6 +201,33 @@ def get_stock_map():
                     stock_map[f"{c}.TWO"] = {"code": c, "name": n}
     except Exception:
         pass
+
+    # 備援：當日成交清單（約 800~900 支）
+    if len(stock_map) < 500:
+        try:
+            r = requests.get(
+                "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+                headers=headers, timeout=15)
+            if r.status_code == 200:
+                for item in r.json():
+                    c = str(item.get("Code", "")).strip()
+                    n = str(item.get("Name", "")).strip()
+                    if len(c) == 4 and c.isdigit() and n:
+                        stock_map[f"{c}.TW"] = {"code": c, "name": n}
+        except Exception:
+            pass
+        try:
+            r = requests.get(
+                "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+                headers=headers, timeout=15)
+            if r.status_code == 200:
+                for item in r.json():
+                    c = str(item.get("SecuritiesCompanyCode", "")).strip()
+                    n = str(item.get("CompanyName", "")).strip()
+                    if len(c) == 4 and c.isdigit() and n:
+                        stock_map[f"{c}.TWO"] = {"code": c, "name": n}
+        except Exception:
+            pass
 
     return stock_map
 
