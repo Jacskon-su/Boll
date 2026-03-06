@@ -163,53 +163,40 @@ init_state()
 # ==========================================
 # 股票清單
 # ==========================================
-@st.cache_data(ttl=86400, show_spinner=False)
+def is_trading_hours():
+    now = datetime.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    open_  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
+    close_ = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    return open_ <= now <= close_
+
 def get_stock_map():
-    """取得全台股完整清單，與狙擊手策略相同方式（twstock）"""
-    stock_map = {}
-
-    # 主要：twstock（Streamlit Cloud 上可正常取得 1700+ 支）
-    if twstock is not None:
-        try:
-            for code, info in twstock.twse.items():
-                if len(code) == 4:
-                    stock_map[f"{code}.TW"] = {"code": code, "name": info.name}
-            for code, info in twstock.tpex.items():
-                if len(code) == 4:
-                    stock_map[f"{code}.TWO"] = {"code": code, "name": info.name}
-            if len(stock_map) > 500:
-                return stock_map
-        except Exception:
-            pass
-
-    # 備援：證交所完整掛牌清單 API
-    headers = {"User-Agent": "Mozilla/5.0"}
+    """完全照狙擊手寫法取得股票清單"""
     try:
-        r = requests.get(
-            "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-            headers=headers, timeout=20)
-        if r.status_code == 200:
-            for item in r.json():
-                c = str(item.get("公司代號", "")).strip()
-                n = str(item.get("公司簡稱", "")).strip()
-                if len(c) == 4 and n:
-                    stock_map[f"{c}.TW"] = {"code": c, "name": n}
-    except Exception:
-        pass
-    try:
-        r = requests.get(
-            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
-            headers=headers, timeout=20)
-        if r.status_code == 200:
-            for item in r.json():
-                c = str(item.get("SecuritiesCompanyCode", "")).strip()
-                n = str(item.get("CompanyName", "")).strip()
-                if len(c) == 4 and n:
-                    stock_map[f"{c}.TWO"] = {"code": c, "name": n}
-    except Exception:
-        pass
+        stock_map = {}
+        for code, info in twstock.twse.items():
+            if len(code) == 4:
+                stock_map[f"{code}.TW"] = {"code": code, "name": info.name}
+        for code, info in twstock.tpex.items():
+            if len(code) == 4:
+                stock_map[f"{code}.TWO"] = {"code": code, "name": info.name}
+        return stock_map
+    except Exception as e:
+        return {}
 
-    return stock_map
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_history_data(symbol, period="6mo"):
+    """照狙擊手寫法，逐支下載，有快取"""
+    try:
+        df = yf.Ticker(symbol).history(period=period)
+        if df.empty:
+            return None
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        return df
+    except Exception:
+        return None
 
 
 # ==========================================
@@ -281,32 +268,14 @@ def check_exit(df):
 # ==========================================
 # 資料下載（逐支快取 + 批量備援）
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_one(symbol: str, period: str = "6mo", scan_date: str = ""):
-    """單支股票下載，scan_date 當快取 key 確保不同日期不混用"""
-    try:
-        df = yf.Ticker(symbol).history(period=period, auto_adjust=True)
-        if df.empty:
-            return None
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        df.columns = [c.capitalize() for c in df.columns]
-        return df
-    except Exception:
-        return None
-
+# 批量下載（照狙擊手：yf.download批量 + fetch_history_data逐支補）
+# ==========================================
 def fetch_all_cached(symbols, period="6mo", pb=None, scan_date=""):
-    """
-    批量下載：先用 yf.download 批量抓（快），
-    失敗的單支再用 fetch_one 補（有快取）
-    scan_date：截斷資料到此日期（含），確保回測不同日期正確
-    """
     all_data   = {}
     chunk_size = 150
     chunks     = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
 
-    # 第一步：批量下載
+    # 第一步：yf.download 批量下載（快）
     for idx, batch in enumerate(chunks, 1):
         if pb:
             pb.progress(idx / len(chunks) * 0.8,
@@ -339,26 +308,24 @@ def fetch_all_cached(symbols, period="6mo", pb=None, scan_date=""):
         except Exception:
             continue
 
-    # 第二步：批量失敗的補用 fetch_one（有快取）
+    # 第二步：失敗的用 fetch_history_data 逐支補（照狙擊手，有快取）
     missing = [s for s in symbols if s not in all_data]
     if missing and pb:
         pb.progress(0.85, text=f"補下載 {len(missing)} 支...")
     for sym in missing:
-        df = fetch_one(sym, period, scan_date)
+        df = fetch_history_data(sym, period)
         if df is not None:
             all_data[sym] = df
 
-    # 第三步：根據 scan_date 截斷（選過去某天掃描用）
+    # 第三步：依 scan_date 截斷
     if scan_date:
-        cutoff = pd.Timestamp(scan_date)
-        trimmed = {}
-        for sym, df in all_data.items():
-            df_cut = df[df.index <= cutoff]
-            if len(df_cut) >= 40:
-                trimmed[sym] = df_cut
+        cutoff  = pd.Timestamp(scan_date)
+        trimmed = {s: d[d.index <= cutoff] for s, d in all_data.items()
+                   if len(d[d.index <= cutoff]) >= 40}
         all_data = trimmed
 
     return all_data
+
 
 # ==========================================
 # 單支股票策略運算（供 ThreadPool 使用）
