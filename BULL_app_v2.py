@@ -290,33 +290,50 @@ def fetch_data_batch(stock_map, period="300d", chunk_size=150):
 def calc_indicators(df):
     # 統一欄位名稱（相容 yfinance 大小寫）
     df.columns = [c.capitalize() for c in df.columns]
+    # 只保留需要的欄位，避免 Dividends / Stock Splits 等干擾
+    needed = [c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
+    df = df[needed].copy()
     p  = PARAMS
     df["SMA"]      = df["Close"].rolling(p["boll_period"]).mean()
     df["STD"]      = df["Close"].rolling(p["boll_period"]).std()
     df["Upper"]    = df["SMA"] + p["boll_std"] * df["STD"]
     df["Lower"]    = df["SMA"] - p["boll_std"] * df["STD"]
     df["BW"]       = df["Upper"] - df["Lower"]
-    df["BW_min"]   = df["BW"].rolling(p["squeeze_n"]).min()
-    df["Vol_MA5"]  = df["Volume"].rolling(5).mean()
-    df["Vol_MA15"] = df["Volume"].rolling(15).mean()
+    df["BW_min"]   = df["BW"].rolling(p["squeeze_n"]).min()   # 過去N天最窄帶寬
+    df["Vol_MA5"]  = df["Volume"].rolling(p["vol_ma_days"]).mean()
+    df["Vol_MA15"] = df["Volume"].rolling(p["vol_shrink_days"]).mean()
+    df["Vol_MA20"] = df["Volume"].rolling(p["vol_ma20_days"]).mean()
+    df["SMA_trend"]= df["SMA"]   # 中軌趨勢用
     return df
 
 def check_entry(df):
-    if len(df) < 3:
+    """
+    進場條件（對應 BULL_v7 回測版）：
+    1. 布林壓縮：今日帶寬 == 過去N天最窄（BW <= BW_min）
+    2. 中軌向上：連續 sma_trend_days 天上升
+    3. 收盤突破上軌
+    4. 爆量：Volume >= Vol_MA5 * vol_ratio 且 >= min_vol_shares
+    """
+    p  = PARAMS
+    n  = p["sma_trend_days"]      # 預設 3
+    if len(df) < n + 1:
         return False
-    p   = PARAMS
-    r   = df.iloc[-1]
-    r1  = df.iloc[-2]
-    r2  = df.iloc[-3]
-    # 布林壓縮
-    squeeze = r["BW"] <= r["BW_min"]
-    # 中軌向上（連續3天）
-    sma_up  = r["SMA"] > r1["SMA"] > r2["SMA"]
-    # 收盤突破上軌
+
+    r  = df.iloc[-1]
+    # 1. 壓縮：今日帶寬是過去 squeeze_n 天最小值
+    squeeze = float(r["BW"]) <= float(r["BW_min"])
+
+    # 2. 中軌向上連續 n 天
+    smas = [df["SMA"].iloc[-(i+1)] for i in range(n)]
+    sma_up = all(smas[i] > smas[i+1] for i in range(len(smas)-1))
+
+    # 3. 突破上軌
     breakout = float(r["Close"]) > float(r["Upper"])
-    # 爆量
-    vol_ok   = (float(r["Volume"]) >= float(r["Vol_MA5"]) * p["vol_ratio"]
-                and float(r["Volume"]) >= p["min_vol_shares"])
+
+    # 4. 爆量
+    vol_ok = (float(r["Volume"]) >= float(r["Vol_MA5"]) * p["vol_ratio"]
+              and float(r["Volume"]) >= p["min_vol_shares"])
+
     return squeeze and sma_up and breakout and vol_ok
 
 def check_addon_b(df, pos_row):
@@ -436,8 +453,9 @@ def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
                     "15MA量"  : int(vma15_a) if vma15_a else 0,
                     "加碼次數": int(pos_row["加碼次數"]),
                     "symbol"  : sym,                 }
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        logger.warning(f"analyze_one 錯誤 [{sym}]: {e}\n{traceback.format_exc()}")
     return result
 
 # ==========================================
