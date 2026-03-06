@@ -209,7 +209,7 @@ def get_stock_info_map():
         logger.error(f"get_stock_info_map 錯誤: {e}")
         return {}
 
-@st.cache_data(ttl=get_cache_ttl(), show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
     try:
         ticker = yf.Ticker(symbol)
@@ -226,28 +226,6 @@ def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
         logger.warning(f"fetch_history_data 錯誤 [{symbol}]: {e}")
         return None
 
-def get_stock_data_with_realtime(code, symbol, analysis_date_str):
-    df = fetch_history_data(symbol)
-    if df is None or df.empty:
-        return None
-
-    last_dt = df.index[-1].strftime('%Y-%m-%d')
-    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
-
-    if analysis_date_str == today_str and last_dt != today_str:
-        try:
-            realtime = twstock.realtime.get(code)
-            if realtime['success'] and realtime['realtime']['latest_trade_price'] != '-':
-                rt = realtime['realtime']
-                new_row = pd.Series({
-                    'Open': float(rt['open']), 'High': float(rt['high']),
-                    'Low': float(rt['low']), 'Close': float(rt['latest_trade_price']),
-                    'Volume': float(rt['accumulate_trade_volume']) * 1000
-                }, name=pd.Timestamp(today_str))
-                df = pd.concat([df, new_row.to_frame().T])
-        except Exception as e:
-            logger.warning(f"get_stock_data_with_realtime 即時資料錯誤 [{code}]: {e}")
-    return df
 
 def fetch_data_batch(stock_map, period="300d", chunk_size=150):
     all_symbols = [info['symbol'] for info in stock_map.values()]
@@ -304,29 +282,85 @@ def fetch_data_batch(stock_map, period="300d", chunk_size=150):
     bar.empty()
     return data_store
 
-def fetch_realtime_batch(codes_list, chunk_size=50):
-    realtime_data = {}
-    progress_text = st.empty()
 
-    for i in range(0, len(codes_list), chunk_size):
-        chunk = codes_list[i:i + chunk_size]
-        progress_text.text(f"⚡ 正在批量更新即時盤... ({i}/{len(codes_list)})")
-        try:
-            stocks = twstock.realtime.get(chunk)
-            if stocks:
-                if 'success' in stocks:
-                    if stocks['success']:
-                        realtime_data[stocks['info']['code']] = stocks['realtime']
-                else:
-                    for code, data in stocks.items():
-                        if data['success']:
-                            realtime_data[code] = data['realtime']
-            time.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"fetch_realtime_batch 錯誤 (offset {i}): {e}")
-    progress_text.empty()
-    return realtime_data
 
+# ==========================================
+# 指標計算 & 訊號判斷
+# ==========================================
+def calc_indicators(df):
+    # 統一欄位名稱（相容 yfinance 大小寫）
+    df.columns = [c.capitalize() for c in df.columns]
+    p  = PARAMS
+    df["SMA"]      = df["Close"].rolling(p["boll_period"]).mean()
+    df["STD"]      = df["Close"].rolling(p["boll_period"]).std()
+    df["Upper"]    = df["SMA"] + p["boll_std"] * df["STD"]
+    df["Lower"]    = df["SMA"] - p["boll_std"] * df["STD"]
+    df["BW"]       = df["Upper"] - df["Lower"]
+    df["BW_min"]   = df["BW"].rolling(p["squeeze_n"]).min()
+    df["Vol_MA5"]  = df["Volume"].rolling(5).mean()
+    df["Vol_MA15"] = df["Volume"].rolling(15).mean()
+    return df
+
+def check_entry(df):
+    if len(df) < 3:
+        return False
+    p   = PARAMS
+    r   = df.iloc[-1]
+    r1  = df.iloc[-2]
+    r2  = df.iloc[-3]
+    # 布林壓縮
+    squeeze = r["BW"] <= r["BW_min"]
+    # 中軌向上（連續3天）
+    sma_up  = r["SMA"] > r1["SMA"] > r2["SMA"]
+    # 收盤突破上軌
+    breakout = float(r["Close"]) > float(r["Upper"])
+    # 爆量
+    vol_ok   = (float(r["Volume"]) >= float(r["Vol_MA5"]) * p["vol_ratio"]
+                and float(r["Volume"]) >= p["min_vol_shares"])
+    return squeeze and sma_up and breakout and vol_ok
+
+def check_addon_b(df, pos_row):
+    """加碼B：突破持倉最高價 且 距上次加碼 >= 10%"""
+    r         = df.iloc[-1]
+    c         = float(r["Close"])
+    last_p    = float(pos_row["上次加碼價"])
+    high_p    = float(pos_row["持倉最高價"])
+    profit    = (c - last_p) / last_p if last_p > 0 else 0
+    triggered = (c > high_p) and (profit >= PARAMS["addon_b_profit"])
+    return triggered, c, last_p, profit
+
+def check_addon_a(df):
+    """加碼A：昨日量縮跌破15MA，今日站回15MA"""
+    if len(df) < 2:
+        return False, None, None, None
+    r   = df.iloc[-1]
+    r1  = df.iloc[-2]
+    c   = float(r["Close"])
+    sma = float(r["SMA"])
+    # 今日站回
+    above_sma  = c >= sma
+    # 昨日量縮跌破
+    y_below    = float(r1["Close"]) < float(r1["SMA"])
+    y_vol_low  = float(r1["Volume"]) < float(r1["Vol_MA15"]) if r1["Vol_MA15"] > 0 else False
+    triggered  = above_sma and y_below and y_vol_low
+    return triggered, c, sma, float(r["Vol_MA15"]) if r["Vol_MA15"] > 0 else None
+
+def check_exit(df):
+    """出場：出量跌破15MA 或 跌破下軌"""
+    if len(df) < 2:
+        return False, None, None, None
+    r    = df.iloc[-1]
+    c    = float(r["Close"])
+    sma  = float(r["SMA"])
+    vma5 = float(r["Vol_MA5"])
+    vol  = float(r["Volume"])
+    # 出量跌破15MA
+    exit1 = (c < sma) and (vol >= vma5 * PARAMS["vol_ratio"])
+    # 跌破下軌
+    exit2 = c < float(r["Lower"])
+    triggered = exit1 or exit2
+    vr = vol / vma5 if vma5 > 0 else 0
+    return triggered, c, sma, vr
 
 # ==========================================
 # 單支股票策略運算（供 ThreadPool 使用）
@@ -339,7 +373,9 @@ def analyze_one(sym, df, stock_map, pos_symbols, pos_df):
         if len(df) < 40:
             return result
         df   = calc_indicators(df.copy())
-        info = stock_map.get(sym, {"code": sym.replace(".TW","").replace(".TWO",""), "name": ""})
+        # stock_map key 是 code（如 "2330"），sym 是 symbol（如 "2330.TW"）
+        code = sym.replace(".TW","").replace(".TWO","")
+        info = stock_map.get(code, {"code": code, "name": code, "short_name": code})
         c    = float(df["Close"].iloc[-1])
 
         # 更新最高價
@@ -434,7 +470,7 @@ def run_scan(stock_map, positions):
         all_data = {c: df[df.index <= cutoff] for c, df in all_data.items()
                     if len(df[df.index <= cutoff]) >= 40}
 
-    pb = st.progress(0, text=f"✅ 下載完成 {len(all_data)} 支，策略運算中...")
+    pb = st.progress(0, text="策略運算中...")
 
     entry_signals   = []
     addon_b_signals = []
